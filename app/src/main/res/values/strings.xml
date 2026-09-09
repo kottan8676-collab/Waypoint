@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Waypoint</string>
+    <string name="service_description">Announces when Gemini, ChatGPT, or Claude generates, then sends the completed response to TalkBack.</string>
+</resources>
