@@ -651,4 +651,39 @@ public final class AiResponseService extends AccessibilityService {
             manager.sendAccessibilityEvent(event);
         }
     }
+    
+    @Override
+    public void onInterrupt() {
+        // Accessibility service interrupted.
+    }
+
+    public static boolean isEnabled(android.content.Context context) {
+        String enabledServices =
+                android.provider.Settings.Secure.getString(
+                        context.getContentResolver(),
+                        android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+
+        if (enabledServices == null) {
+            return false;
+        }
+
+        android.text.TextUtils.SimpleStringSplitter splitter =
+                new android.text.TextUtils.SimpleStringSplitter(':');
+        splitter.setString(enabledServices);
+
+        while (splitter.hasNext()) {
+            android.content.ComponentName component =
+                    android.content.ComponentName.unflattenFromString(
+                            splitter.next());
+
+            if (component != null
+                    && component.getPackageName().equals(context.getPackageName())
+                    && component.getClassName().equals(AiResponseService.class.getName())) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 }
