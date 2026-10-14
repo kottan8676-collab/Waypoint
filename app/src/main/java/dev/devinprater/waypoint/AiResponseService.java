@@ -634,6 +634,7 @@ public final class AiResponseService extends AccessibilityService {
                 + ", package=" + activePackage
                 + ", characters=" + text.length());
 
+        
         AccessibilityEvent event =
                 AccessibilityEvent.obtain(
                         AccessibilityEvent.TYPE_ANNOUNCEMENT);
@@ -644,4 +645,10 @@ public final class AiResponseService extends AccessibilityService {
 
         AccessibilityManager manager =
                 (AccessibilityManager) getSystemService(
-                
+                        ACCESSIBILITY_SERVICE);
+
+        if (manager != null && manager.isEnabled()) {
+            manager.sendAccessibilityEvent(event);
+        }
+    }
+}
