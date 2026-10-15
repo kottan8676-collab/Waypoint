@@ -551,4 +551,217 @@ public final class AiResponseService extends AccessibilityService {
 
     private static boolean isSuggestionInCluster(
             AccessibilityNodeInfo textNode,
-            AccessibilityNode
+            AccessibilityNodeInfo boundary) {
+        AccessibilityNodeInfo node = textNode.getParent();
+        while (node != null && node != boundary) {
+            if (node.isClickable()) {
+                AccessibilityNodeInfo parent = node.getParent();
+                return parent != null
+                        && collectTextNodes(parent).size() > 1;
+            }
+            node = node.getParent();
+        }
+        return false;
+    }
+
+    private static ArrayList<AccessibilityNodeInfo> collectTextNodes(
+            AccessibilityNodeInfo root) {
+        ArrayList<AccessibilityNodeInfo> result = new ArrayList<>();
+        ArrayList<AccessibilityNodeInfo> queue = new ArrayList<>();
+        queue.add(root);
+
+        for (int i = 0; i < queue.size(); i++) {
+            AccessibilityNodeInfo current = queue.get(i);
+            if (!clean(current.getText()).isEmpty()
+                    && current.getChildCount() == 0) {
+                result.add(current);
+            }
+
+            for (int c = 0; c < current.getChildCount(); c++) {
+                AccessibilityNodeInfo child = current.getChild(c);
+                if (child != null) {
+                    queue.add(child);
+                }
+            }
+        }
+        return result;
+    }
+
+    private static boolean hasViewId(
+            AccessibilityNodeInfo node, String id) {
+        List<AccessibilityNodeInfo> matches =
+                node.findAccessibilityNodeInfosByViewId(id);
+        return matches != null && !matches.isEmpty();
+    }
+
+    private static boolean hasDescription(
+            AccessibilityNodeInfo node, String wanted) {
+        return findLastByDescription(node, wanted) != null;
+    }
+
+    private static boolean hasDescriptionContainingAny(
+            AccessibilityNodeInfo node, String... wantedValues) {
+        ArrayList<AccessibilityNodeInfo> queue = new ArrayList<>();
+        queue.add(node);
+
+        for (int i = 0; i < queue.size(); i++) {
+            AccessibilityNodeInfo current = queue.get(i);
+            CharSequence description = current.getContentDescription();
+            String value = description == null
+                    ? "" : description.toString().toLowerCase(Locale.ROOT);
+
+            for (String wanted : wantedValues) {
+                if (value.contains(wanted.toLowerCase(Locale.ROOT))) {
+                    return true;
+                }
+            }
+
+            for (int c = 0; c < current.getChildCount(); c++) {
+                AccessibilityNodeInfo child = current.getChild(c);
+                if (child != null) {
+                    queue.add(child);
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasTextContainingAny(
+            AccessibilityNodeInfo node, String... wantedValues) {
+        for (AccessibilityNodeInfo textNode : collectTextNodes(node)) {
+            String value = clean(textNode.getText()).toLowerCase(Locale.ROOT);
+            for (String wanted : wantedValues) {
+                if (value.contains(wanted.toLowerCase(Locale.ROOT))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static AccessibilityNodeInfo findLastByDescription(
+            AccessibilityNodeInfo node, String wanted) {
+        ArrayList<AccessibilityNodeInfo> queue = new ArrayList<>();
+        queue.add(node);
+        AccessibilityNodeInfo found = null;
+
+        for (int i = 0; i < queue.size(); i++) {
+            AccessibilityNodeInfo current = queue.get(i);
+            CharSequence description = current.getContentDescription();
+            if (description != null && wanted.contentEquals(description)) {
+                found = current;
+            }
+
+            for (int c = 0; c < current.getChildCount(); c++) {
+                AccessibilityNodeInfo child = current.getChild(c);
+                if (child != null) {
+                    queue.add(child);
+                }
+            }
+        }
+        return found;
+    }
+
+    private static AccessibilityNodeInfo findLastByDescriptionContaining(
+            AccessibilityNodeInfo node, String wanted) {
+        ArrayList<AccessibilityNodeInfo> queue = new ArrayList<>();
+        queue.add(node);
+        AccessibilityNodeInfo found = null;
+        String target = wanted.toLowerCase(Locale.ROOT);
+
+        for (int i = 0; i < queue.size(); i++) {
+            AccessibilityNodeInfo current = queue.get(i);
+            CharSequence description = current.getContentDescription();
+            if (description != null
+                    && description.toString().toLowerCase(Locale.ROOT)
+                    .contains(target)) {
+                found = current;
+            }
+
+            for (int c = 0; c < current.getChildCount(); c++) {
+                AccessibilityNodeInfo child = current.getChild(c);
+                if (child != null) {
+                    queue.add(child);
+                }
+            }
+        }
+        return found;
+    }
+
+    private static boolean hasText(
+            AccessibilityNodeInfo node, String wanted) {
+        for (AccessibilityNodeInfo textNode : collectTextNodes(node)) {
+            if (wanted.equals(clean(textNode.getText()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String clean(CharSequence value) {
+        return value == null ? ""
+                : value.toString().trim().replaceAll("[\\t ]+", " ");
+    }
+
+    private void announce(String text) {
+        announce(text, "completed-response");
+    }
+
+    private void announce(String text, String kind) {
+        Log.i(TAG, "Announcing; kind=" + kind
+                + ", package=" + activePackage
+                + ", characters=" + text.length());
+
+        AccessibilityEvent event = AccessibilityEvent.obtain(
+                AccessibilityEvent.TYPE_ANNOUNCEMENT);
+        event.setPackageName(getPackageName());
+        event.setClassName(getClass().getName());
+        event.getText().add(text);
+
+        AccessibilityManager manager = (AccessibilityManager)
+                getSystemService(ACCESSIBILITY_SERVICE);
+        if (manager != null && manager.isEnabled()) {
+            manager.sendAccessibilityEvent(event);
+        }
+    }
+
+    @Override
+    public void onInterrupt() {
+        // Accessibility service interrupted.
+    }
+
+    @Override
+    public void onDestroy() {
+        handler.removeCallbacks(finishCheck);
+        handler.removeCallbacks(chatGptAutoScroll);
+        super.onDestroy();
+    }
+
+    public static boolean isEnabled(Context context) {
+        String enabledServices = android.provider.Settings.Secure.getString(
+                context.getContentResolver(),
+                android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+
+        if (enabledServices == null) {
+            return false;
+        }
+
+        TextUtils.SimpleStringSplitter splitter =
+                new TextUtils.SimpleStringSplitter(':');
+        splitter.setString(enabledServices);
+
+        while (splitter.hasNext()) {
+            android.content.ComponentName component =
+                    android.content.ComponentName.unflattenFromString(
+                            splitter.next());
+            if (component != null
+                    && component.getPackageName().equals(
+                    context.getPackageName())
+                    && component.getClassName().equals(
+                    AiResponseService.class.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
