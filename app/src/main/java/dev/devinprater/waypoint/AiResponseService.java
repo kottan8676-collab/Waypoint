@@ -12,6 +12,7 @@ import android.view.accessibility.AccessibilityNodeInfo;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 public final class AiResponseService extends AccessibilityService {
     private static final String TAG = "Waypoint";
@@ -19,6 +20,7 @@ public final class AiResponseService extends AccessibilityService {
             "com.google.android.googlequicksearchbox";
     private static final String CHATGPT_PACKAGE = "com.openai.chatgpt";
     private static final String CLAUDE_PACKAGE = "com.anthropic.claude";
+
     private static final String GEMINI_RESPONSE_ID =
             GEMINI_PACKAGE + ":id/assistant_robin_text";
     private static final String GEMINI_MESSAGE_CONTENT_ID =
@@ -29,9 +31,10 @@ public final class AiResponseService extends AccessibilityService {
             GEMINI_PACKAGE + ":id/assistant_robin_code_impl";
     private static final String GEMINI_STOP_ID =
             GEMINI_PACKAGE + ":id/assistant_robin_stop_icon_button_compose";
+
     private static final long SETTLE_MS = 3000;
     private static final long CHATGPT_SCROLL_RETRY_MS = 650;
-    private static final int MAX_CHATGPT_SCROLL_ATTEMPTS = 16;
+    private static final int MAX_CHATGPT_SCROLL_ATTEMPTS = 24;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -48,6 +51,7 @@ public final class AiResponseService extends AccessibilityService {
         if (root == null || isGenerating(root)) {
             return;
         }
+
         String response = findLatestResponse(root);
         if (!response.isEmpty()
                 && response.equals(pendingResponse)
@@ -55,14 +59,15 @@ public final class AiResponseService extends AccessibilityService {
             announce(response);
             lastSpoken = response;
             awaitingCompletion = false;
+            stopChatGptAutoScroll();
         }
     };
 
     /*
-     * ChatGPT sometimes does not expose its response action buttons until
-     * the conversation is scrolled. Scroll in small steps, then use the
-     * existing Read aloud anchor to extract the response. Gemini and Claude
-     * never enter this runnable.
+     * ChatGPT may expose its action buttons only after the conversation is
+     * scrolled. Scroll a little at a time, then look for the localized
+     * "Read aloud" action and extract the answer. Gemini and Claude do not
+     * use this runnable.
      */
     private final Runnable chatGptAutoScroll = new Runnable() {
         @Override
@@ -78,14 +83,13 @@ public final class AiResponseService extends AccessibilityService {
                 return;
             }
 
-            // Do not scroll while ChatGPT is still generating an answer.
             if (isGenerating(root)) {
                 retryChatGptAutoScroll();
                 return;
             }
 
             AccessibilityNodeInfo readAloud =
-                    findLastByDescription(root, "Read aloud");
+                    findChatGptReadAloudAction(root);
             if (readAloud != null) {
                 String response = findLatestChatGptResponse(root);
                 if (!response.isEmpty()) {
@@ -106,8 +110,8 @@ public final class AiResponseService extends AccessibilityService {
             chatGptScrollAttempts++;
             boolean moved = scrollForward(root);
             Log.d(TAG, "ChatGPT auto-scroll attempt=" + chatGptScrollAttempts
-                    + ", moved=" + moved + ", readAloudFound="
-                    + (readAloud != null));
+                    + ", moved=" + moved
+                    + ", readAloudFound=" + (readAloud != null));
             retryChatGptAutoScroll();
         }
     };
@@ -148,22 +152,30 @@ public final class AiResponseService extends AccessibilityService {
 
         if (nowGenerating) {
             handler.removeCallbacks(finishCheck);
-            pendingResponse = response;
+            if (!response.isEmpty()) {
+                pendingResponse = response;
+            }
         } else if (CHATGPT_PACKAGE.equals(packageName)) {
             if (!response.isEmpty() && !response.equals(lastSpoken)) {
-                // The action button is available: use the normal completion check.
                 stopChatGptAutoScroll();
                 pendingResponse = response;
                 handler.removeCallbacks(finishCheck);
                 handler.postDelayed(finishCheck, SETTLE_MS);
-            } else if (response.isEmpty() && !chatGptAutoScrollScheduled) {
-                // Button not exposed yet. Wait for a quiet period, then scroll.
+            } else if (!chatGptAutoScrollScheduled
+                    && !response.equals(lastSpoken)) {
+                /*
+                 * Start scrolling even when response extraction is empty.
+                 * In Japanese ChatGPT, the action label may not be "Read aloud",
+                 * so the extractor can remain empty until the correct action
+                 * is found.
+                 */
                 chatGptScrollAttempts = 0;
                 chatGptAutoScrollScheduled = true;
+                handler.removeCallbacks(chatGptAutoScroll);
                 handler.postDelayed(chatGptAutoScroll, SETTLE_MS);
             }
         } else if (awaitingCompletion) {
-            // Original Gemini/Claude completion behavior is retained.
+            // Preserve the existing Gemini/Claude completion path.
             pendingResponse = response;
             handler.removeCallbacks(finishCheck);
             handler.postDelayed(finishCheck, SETTLE_MS);
@@ -184,9 +196,9 @@ public final class AiResponseService extends AccessibilityService {
     }
 
     private boolean scrollForward(AccessibilityNodeInfo root) {
-        // Try the root first, then scrollable descendants.
         if (root.isScrollable()
-                && root.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
+                && root.performAction(
+                AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
             return true;
         }
 
@@ -199,6 +211,7 @@ public final class AiResponseService extends AccessibilityService {
                     AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
                 return true;
             }
+
             for (int c = 0; c < current.getChildCount(); c++) {
                 AccessibilityNodeInfo child = current.getChild(c);
                 if (child != null) {
@@ -206,21 +219,32 @@ public final class AiResponseService extends AccessibilityService {
                 }
             }
         }
+
         return root.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
     }
 
     private boolean isGenerating(AccessibilityNodeInfo root) {
         if (CHATGPT_PACKAGE.equals(activePackage)) {
-            return hasDescriptionContaining(root, "Stop")
-                    || hasTextContaining(root, "Thinking");
+            return hasDescriptionContainingAny(root,
+                    "Stop", "Stop generating", "Stop response",
+                    "回答を停止", "生成を停止", "応答を停止")
+                    || hasTextContainingAny(root,
+                    "Thinking", "Generating", "考え中", "回答を生成中");
         }
+
         if (CLAUDE_PACKAGE.equals(activePackage)) {
             return hasDescription(root, "Stop responding")
                     || hasDescription(root, "Claude is thinking")
-                    || hasText(root, "Sending…");
+                    || hasDescriptionContainingAny(root,
+                    "応答を停止", "回答を停止")
+                    || hasText(root, "Sending…")
+                    || hasText(root, "送信中…");
         }
+
         return hasViewId(root, GEMINI_STOP_ID)
-                || hasDescription(root, "Stop generating response");
+                || hasDescription(root, "Stop generating response")
+                || hasDescriptionContainingAny(root,
+                "回答の生成を停止", "生成を停止");
     }
 
     private String findLatestResponse(AccessibilityNodeInfo root) {
@@ -240,6 +264,7 @@ public final class AiResponseService extends AccessibilityService {
         if (messages == null || messages.isEmpty()) {
             return "";
         }
+
         AccessibilityNodeInfo message = messages.get(messages.size() - 1);
         ArrayList<String> parts = new ArrayList<>();
         appendGeminiContent(message, parts);
@@ -262,6 +287,7 @@ public final class AiResponseService extends AccessibilityService {
             }
             return;
         }
+
         if (GEMINI_RESPONSE_ID.equals(id)) {
             String prose = clean(node.getText());
             if (!prose.isEmpty()) {
@@ -269,6 +295,7 @@ public final class AiResponseService extends AccessibilityService {
             }
             return;
         }
+
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child != null) {
@@ -278,8 +305,7 @@ public final class AiResponseService extends AccessibilityService {
     }
 
     private String findLatestChatGptResponse(AccessibilityNodeInfo root) {
-        AccessibilityNodeInfo readAloud =
-                findLastByDescription(root, "Read aloud");
+        AccessibilityNodeInfo readAloud = findChatGptReadAloudAction(root);
         if (readAloud == null) {
             return "";
         }
@@ -320,6 +346,31 @@ public final class AiResponseService extends AccessibilityService {
         return TextUtils.join("\n", parts).trim();
     }
 
+    /*
+     * ChatGPT's accessibility labels can be localized. Check Japanese and
+     * English labels instead of relying only on the exact English phrase.
+     */
+    private AccessibilityNodeInfo findChatGptReadAloudAction(
+            AccessibilityNodeInfo root) {
+        String[] labels = {
+                "Read aloud",
+                "読み上げ",
+                "読み上げる",
+                "音声で読み上げ",
+                "回答を読み上げ",
+                "音声で回答を読み上げ"
+        };
+
+        for (String label : labels) {
+            AccessibilityNodeInfo found =
+                    findLastByDescriptionContaining(root, label);
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
+    }
+
     private static void appendChatGptContent(
             AccessibilityNodeInfo node,
             AccessibilityNodeInfo boundary,
@@ -339,6 +390,7 @@ public final class AiResponseService extends AccessibilityService {
             }
             return;
         }
+
         if (node.getChildCount() == 0) {
             if (isSuggestionInCluster(node, boundary)) {
                 return;
@@ -349,6 +401,7 @@ public final class AiResponseService extends AccessibilityService {
             }
             return;
         }
+
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child != null) {
@@ -358,13 +411,16 @@ public final class AiResponseService extends AccessibilityService {
     }
 
     private static boolean isChatGptCodeBlock(AccessibilityNodeInfo node) {
-        if (!hasDescription(node, "Copy code")
+        if (!hasDescriptionContainingAny(node, "Copy code", "コードをコピー")
                 || collectTextNodes(node).isEmpty()) {
             return false;
         }
+
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null && hasDescription(child, "Copy code")
+            if (child != null
+                    && hasDescriptionContainingAny(
+                    child, "Copy code", "コードをコピー")
                     && !collectTextNodes(child).isEmpty()) {
                 return false;
             }
@@ -373,18 +429,26 @@ public final class AiResponseService extends AccessibilityService {
     }
 
     private String findLatestClaudeResponse(AccessibilityNodeInfo root) {
-        AccessibilityNodeInfo anchor = findLastByDescription(root, "Copy message");
+        AccessibilityNodeInfo anchor =
+                findLastByDescriptionContaining(root, "Copy message");
+        if (anchor == null) {
+            anchor = findLastByDescriptionContaining(root, "メッセージをコピー");
+        }
         if (anchor == null) {
             return "";
         }
+
         AccessibilityNodeInfo message = anchor;
         while (message != null) {
             for (int actionIndex = message.getChildCount() - 1;
                     actionIndex >= 1; actionIndex--) {
                 AccessibilityNodeInfo actions = message.getChild(actionIndex);
-                if (actions == null || !hasDescription(actions, "Copy message")) {
+                if (actions == null
+                        || !(hasDescriptionContainingAny(
+                        actions, "Copy message", "メッセージをコピー"))) {
                     continue;
                 }
+
                 int contentStart = 0;
                 for (int i = 0; i < actionIndex; i++) {
                     AccessibilityNodeInfo child = message.getChild(i);
@@ -393,6 +457,7 @@ public final class AiResponseService extends AccessibilityService {
                         contentStart = i + 1;
                     }
                 }
+
                 ArrayList<String> parts = new ArrayList<>();
                 for (int i = contentStart; i < actionIndex; i++) {
                     AccessibilityNodeInfo child = message.getChild(i);
@@ -415,7 +480,9 @@ public final class AiResponseService extends AccessibilityService {
             ArrayList<String> codeParts = new ArrayList<>();
             for (int i = 0; i < node.getChildCount(); i++) {
                 AccessibilityNodeInfo child = node.getChild(i);
-                if (child == null || hasDescription(child, "Copy code")) {
+                if (child == null
+                        || hasDescriptionContainingAny(
+                        child, "Copy code", "コードをコピー")) {
                     continue;
                 }
                 for (AccessibilityNodeInfo textNode : collectTextNodes(child)) {
@@ -432,6 +499,7 @@ public final class AiResponseService extends AccessibilityService {
             }
             return;
         }
+
         if (node.getChildCount() == 0) {
             String text = clean(node.getText());
             if (!text.isEmpty() && !parts.contains(text)) {
@@ -439,6 +507,7 @@ public final class AiResponseService extends AccessibilityService {
             }
             return;
         }
+
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child != null) {
@@ -450,21 +519,27 @@ public final class AiResponseService extends AccessibilityService {
     private static boolean isClaudeCodeBlock(AccessibilityNodeInfo node) {
         boolean hasHeader = false;
         boolean hasCode = false;
+
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child == null) {
                 continue;
             }
-            if (hasDescription(child, "Copy code")
-                    && hasDescription(child, "Expand code")) {
+
+            if (hasDescriptionContainingAny(
+                    child, "Copy code", "コードをコピー")
+                    && hasDescriptionContainingAny(
+                    child, "Expand code", "コードを展開")) {
                 hasHeader = true;
             } else if (!collectTextNodes(child).isEmpty()) {
                 hasCode = true;
             }
         }
+
         if (!hasHeader || !hasCode) {
             return false;
         }
+
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child != null && isClaudeCodeBlock(child)) {
@@ -475,164 +550,5 @@ public final class AiResponseService extends AccessibilityService {
     }
 
     private static boolean isSuggestionInCluster(
-            AccessibilityNodeInfo textNode, AccessibilityNodeInfo boundary) {
-        AccessibilityNodeInfo node = textNode.getParent();
-        while (node != null && node != boundary) {
-            if (node.isClickable()) {
-                AccessibilityNodeInfo parent = node.getParent();
-                return parent != null && collectTextNodes(parent).size() > 1;
-            }
-            node = node.getParent();
-        }
-        return false;
-    }
-
-    private static ArrayList<AccessibilityNodeInfo> collectTextNodes(
-            AccessibilityNodeInfo root) {
-        ArrayList<AccessibilityNodeInfo> result = new ArrayList<>();
-        ArrayList<AccessibilityNodeInfo> queue = new ArrayList<>();
-        queue.add(root);
-        for (int i = 0; i < queue.size(); i++) {
-            AccessibilityNodeInfo current = queue.get(i);
-            if (!clean(current.getText()).isEmpty()
-                    && current.getChildCount() == 0) {
-                result.add(current);
-            }
-            for (int c = 0; c < current.getChildCount(); c++) {
-                AccessibilityNodeInfo child = current.getChild(c);
-                if (child != null) {
-                    queue.add(child);
-                }
-            }
-        }
-        return result;
-    }
-
-    private static boolean hasViewId(AccessibilityNodeInfo node, String id) {
-        List<AccessibilityNodeInfo> matches =
-                node.findAccessibilityNodeInfosByViewId(id);
-        return matches != null && !matches.isEmpty();
-    }
-
-    private static boolean hasDescription(
-            AccessibilityNodeInfo node, String wanted) {
-        return findLastByDescription(node, wanted) != null;
-    }
-
-    private static boolean hasDescriptionContaining(
-            AccessibilityNodeInfo node, String wanted) {
-        ArrayList<AccessibilityNodeInfo> queue = new ArrayList<>();
- 
-        queue.add(node);
-        for (int i = 0; i < queue.size(); i++) {
-            AccessibilityNodeInfo current = queue.get(i);
-            CharSequence description = current.getContentDescription();
-            if (description != null && description.toString().toLowerCase()
-                    .contains(wanted.toLowerCase())) {
-                return true;
-            }
-            for (int c = 0; c < current.getChildCount(); c++) {
-                AccessibilityNodeInfo child = current.getChild(c);
-                if (child != null) {
-                    queue.add(child);
-                }
-            }
-        }
-        return false;
-    }
-
-    private static AccessibilityNodeInfo findLastByDescription(
-            AccessibilityNodeInfo node, String wanted) {
-        ArrayList<AccessibilityNodeInfo> queue = new ArrayList<>();
-        queue.add(node);
-        AccessibilityNodeInfo found = null;
-        for (int i = 0; i < queue.size(); i++) {
-            AccessibilityNodeInfo current = queue.get(i);
-            CharSequence description = current.getContentDescription();
-            if (description != null && wanted.contentEquals(description)) {
-                found = current;
-            }
-            for (int c = 0; c < current.getChildCount(); c++) {
-                AccessibilityNodeInfo child = current.getChild(c);
-                if (child != null) {
-                    queue.add(child);
-                }
-            }
-        }
-        return found;
-    }
-
-    private static boolean hasText(AccessibilityNodeInfo node, String wanted) {
-        for (AccessibilityNodeInfo textNode : collectTextNodes(node)) {
-            if (wanted.equals(clean(textNode.getText()))) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean hasTextContaining(
-            AccessibilityNodeInfo node, String wanted) {
-        for (AccessibilityNodeInfo textNode : collectTextNodes(node)) {
-            if (clean(textNode.getText()).toLowerCase()
-                    .contains(wanted.toLowerCase())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static String clean(CharSequence value) {
-        return value == null ? ""
-                : value.toString().trim().replaceAll("[\\t ]+", " ");
-    }
-
-    private void announce(String text) {
-        announce(text, "completed-response");
-    }
-
-    private void announce(String text, String kind) {
-        Log.i(TAG, "Announcing; kind=" + kind
-                + ", package=" + activePackage
-                + ", characters=" + text.length());
-        AccessibilityEvent event = AccessibilityEvent.obtain(
-                AccessibilityEvent.TYPE_ANNOUNCEMENT);
-        event.setPackageName(getPackageName());
-        event.setClassName(getClass().getName());
-        event.getText().add(text);
-        AccessibilityManager manager = (AccessibilityManager)
-                getSystemService(ACCESSIBILITY_SERVICE);
-        if (manager != null && manager.isEnabled()) {
-            manager.sendAccessibilityEvent(event);
-        }
-    }
-
-    @Override
-    public void onInterrupt() {
-        // Accessibility service interrupted.
-    }
-
-    public static boolean isEnabled(Context context) {
-        String enabledServices = android.provider.Settings.Secure.getString(
-                context.getContentResolver(),
-                android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-        if (enabledServices == null) {
-            return false;
-        }
-        TextUtils.SimpleStringSplitter splitter =
-                new TextUtils.SimpleStringSplitter(':');
-        splitter.setString(enabledServices);
-        while (splitter.hasNext()) {
-            android.content.ComponentName component =
-                    android.content.ComponentName.unflattenFromString(
-                            splitter.next());
-            if (component != null
-                    && component.getPackageName().equals(context.getPackageName())
-                    && component.getClassName().equals(AiResponseService.class.getName())) {
-                return true;
-            }
-        }
-        return false;
-    }
-}
-
+            AccessibilityNodeInfo textNode,
+            AccessibilityNode
