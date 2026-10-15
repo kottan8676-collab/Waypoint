@@ -4,6 +4,8 @@ import android.accessibilityservice.AccessibilityService;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
+import android.speech.tts.TextToSpeech;
+import android.os.Build;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
@@ -13,6 +15,7 @@ import android.view.accessibility.AccessibilityNodeInfo;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Collections;
 
 public final class AiResponseService extends AccessibilityService {
     private static final String TAG = "Waypoint";
@@ -45,143 +48,177 @@ public final class AiResponseService extends AccessibilityService {
     private String activePackage = "";
     private boolean chatGptAutoScrollScheduled;
     private int chatGptScrollAttempts;
+    private TextToSpeech speech;
+    private boolean speechReady;
+    private boolean chatGptSawGeneration;
+    private long responseChangedAt;
+    private String lastCandidate = "";
+    private boolean finishingChatGpt;
+    private static final long QUIET_MS = 1700;
+    private static final int MAX_SPEECH_CHUNK = 3200;
 
-    private final Runnable finishCheck = () -> {
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null || isGenerating(root)) {
-            return;
-        }
-
-        String response = findLatestResponse(root);
-        if (!response.isEmpty()
-                && response.equals(pendingResponse)
-                && !response.equals(lastSpoken)) {
-            announce(response);
-            lastSpoken = response;
-            awaitingCompletion = false;
-            stopChatGptAutoScroll();
-        }
-    };
-
-    /*
-     * ChatGPT may expose its action buttons only after the conversation is
-     * scrolled. Scroll a little at a time, then look for the localized
-     * "Read aloud" action and extract the answer. Gemini and Claude do not
-     * use this runnable.
-     */
-    private final Runnable chatGptAutoScroll = new Runnable() {
-        @Override
-        public void run() {
-            if (!CHATGPT_PACKAGE.equals(activePackage)) {
+    private final Runnable finishCheck = new Runnable() {
+        @Override public void run() {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root == null) return;
+            if (CHATGPT_PACKAGE.equals(activePackage)) {
+                boolean busy = isGenerating(root);
+                String candidate = findLatestResponse(root);
+                if (!candidate.equals(lastCandidate)) {
+                    lastCandidate = candidate;
+                    responseChangedAt = System.currentTimeMillis();
+                }
+                if (busy) {
+                    handler.postDelayed(this, 600);
+                    return;
+                }
+                if (chatGptSawGeneration && !finishingChatGpt) {
+                    finishingChatGpt = true;
+                    lastCandidate = "";
+                    responseChangedAt = System.currentTimeMillis();
+                    beginChatGptAutoScroll();
+                }
+                if (candidate.isEmpty()) {
+                    if (chatGptSawGeneration) handler.postDelayed(this, 650);
+                    return;
+                }
+                long quietFor = System.currentTimeMillis() - responseChangedAt;
+                if (quietFor < QUIET_MS) {
+                    handler.postDelayed(this, QUIET_MS - quietFor + 100);
+                    return;
+                }
+                if (chatGptSawGeneration && !candidate.equals(lastSpoken)) {
+                    speak(candidate);
+                    lastSpoken = candidate;
+                }
+                chatGptSawGeneration = false;
+                finishingChatGpt = false;
                 stopChatGptAutoScroll();
                 return;
             }
+            if (isGenerating(root)) return;
+            String response = findLatestResponse(root);
+            if (!response.isEmpty() && response.equals(pendingResponse)
+                    && !response.equals(lastSpoken)) {
+                speak(response);
+                lastSpoken = response;
+                awaitingCompletion = false;
+            }
+        }
+    };
 
+    /** Continue scrolling to reveal the action row after a ChatGPT reply. */
+    private final Runnable chatGptAutoScroll = new Runnable() {
+        @Override public void run() {
+            if (!CHATGPT_PACKAGE.equals(activePackage) || !finishingChatGpt) {
+                stopChatGptAutoScroll();
+                return;
+            }
             AccessibilityNodeInfo root = getRootInActiveWindow();
             if (root == null) {
                 retryChatGptAutoScroll();
                 return;
             }
-
             if (isGenerating(root)) {
                 retryChatGptAutoScroll();
                 return;
             }
-
-            AccessibilityNodeInfo readAloud =
-                    findChatGptReadAloudAction(root);
-            if (readAloud != null) {
-                String response = findLatestChatGptResponse(root);
-                if (!response.isEmpty()) {
-                    pendingResponse = response;
-                    handler.removeCallbacks(finishCheck);
-                    handler.postDelayed(finishCheck, 500);
-                    stopChatGptAutoScroll();
-                    return;
-                }
-            }
-
-            if (chatGptScrollAttempts >= MAX_CHATGPT_SCROLL_ATTEMPTS) {
-                Log.w(TAG, "ChatGPT auto-scroll stopped: attempt limit reached");
+            AccessibilityNodeInfo action = findChatGptReadAloudAction(root);
+            if (action != null && !findLatestChatGptResponse(root).isEmpty()) {
+                Log.i(TAG, "ChatGPT response action visible");
                 stopChatGptAutoScroll();
                 return;
             }
-
-            chatGptScrollAttempts++;
+            if (chatGptScrollAttempts++ >= MAX_CHATGPT_SCROLL_ATTEMPTS) {
+                Log.w(TAG, "ChatGPT scroll attempts exhausted");
+                stopChatGptAutoScroll();
+                return;
+            }
             boolean moved = scrollForward(root);
-            Log.d(TAG, "ChatGPT auto-scroll attempt=" + chatGptScrollAttempts
-                    + ", moved=" + moved
-                    + ", readAloudFound=" + (readAloud != null));
+            Log.d(TAG, "ChatGPT scroll " + chatGptScrollAttempts + " moved=" + moved);
             retryChatGptAutoScroll();
         }
     };
 
-    @Override
-    public void onAccessibilityEvent(AccessibilityEvent event) {
-        CharSequence pkg = event.getPackageName();
-        if (pkg == null
-                || (!GEMINI_PACKAGE.contentEquals(pkg)
-                && !CHATGPT_PACKAGE.contentEquals(pkg)
-                && !CLAUDE_PACKAGE.contentEquals(pkg))) {
-            return;
-        }
+    @Override protected void onServiceConnected() {
+        super.onServiceConnected();
+        speech = new TextToSpeech(getApplicationContext(), status -> {
+            if (status == TextToSpeech.SUCCESS && speech != null) {
+                int result = speech.setLanguage(Locale.JAPANESE);
+                speechReady = result != TextToSpeech.LANG_NOT_SUPPORTED
+                        && result != TextToSpeech.LANG_MISSING_DATA;
+                if (!speechReady) speechReady = speech.setLanguage(Locale.getDefault()) >= 0;
+                Log.i(TAG, "TTS initialized: " + speechReady);
+            } else {
+                Log.e(TAG, "TTS initialization failed: " + status);
+            }
+        });
+    }
 
+    @Override public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null || event.getPackageName() == null) return;
+        CharSequence pkg = event.getPackageName();
+        if (!GEMINI_PACKAGE.contentEquals(pkg)
+                && !CHATGPT_PACKAGE.contentEquals(pkg)
+                && !CLAUDE_PACKAGE.contentEquals(pkg)) return;
         String packageName = pkg.toString();
         if (!packageName.equals(activePackage)) {
             handler.removeCallbacks(finishCheck);
             stopChatGptAutoScroll();
             generating = false;
             awaitingCompletion = false;
+            finishingChatGpt = false;
+            chatGptSawGeneration = false;
             pendingResponse = "";
+            lastCandidate = "";
             lastSpoken = "";
             activePackage = packageName;
         }
-
         AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) {
-            return;
-        }
-
+        if (root == null) return;
         boolean nowGenerating = isGenerating(root);
-        String response = findLatestResponse(root);
-
-        if (nowGenerating && !generating) {
-            announce("Generating", "generation-start");
-            awaitingCompletion = true;
-        }
-
-        if (nowGenerating) {
-            handler.removeCallbacks(finishCheck);
-            if (!response.isEmpty()) {
-                pendingResponse = response;
-            }
-        } else if (CHATGPT_PACKAGE.equals(packageName)) {
-            if (!response.isEmpty() && !response.equals(lastSpoken)) {
+        if (CHATGPT_PACKAGE.equals(packageName)) {
+            if (nowGenerating) {
+                chatGptSawGeneration = true;
+                finishingChatGpt = false;
+                handler.removeCallbacks(finishCheck);
                 stopChatGptAutoScroll();
+                handler.removeCallbacks(finishCheck);
+                handler.postDelayed(finishCheck, 600);
+            } else if (generating && !nowGenerating && chatGptSawGeneration) {
+                finishingChatGpt = true;
+                lastCandidate = "";
+                responseChangedAt = System.currentTimeMillis();
+                handler.removeCallbacks(finishCheck);
+                handler.postDelayed(finishCheck, SETTLE_MS);
+                beginChatGptAutoScroll();
+            } else if (finishingChatGpt) {
+                // The accessibility tree can change even after the stop button disappears.
+                handler.removeCallbacks(finishCheck);
+                handler.postDelayed(finishCheck, 300);
+            }
+        } else {
+            String response = findLatestResponse(root);
+            if (nowGenerating && !generating) {
+                announce("Generating", "generation-start");
+                awaitingCompletion = true;
+            }
+            if (nowGenerating) {
+                handler.removeCallbacks(finishCheck);
+                if (!response.isEmpty()) pendingResponse = response;
+            } else if (awaitingCompletion) {
                 pendingResponse = response;
                 handler.removeCallbacks(finishCheck);
                 handler.postDelayed(finishCheck, SETTLE_MS);
-            } else if (!chatGptAutoScrollScheduled
-                    && !response.equals(lastSpoken)) {
-                /*
-                 * Start scrolling even when response extraction is empty.
-                 * In Japanese ChatGPT, the action label may not be "Read aloud",
-                 * so the extractor can remain empty until the correct action
-                 * is found.
-                 */
-                chatGptScrollAttempts = 0;
-                chatGptAutoScrollScheduled = true;
-                handler.removeCallbacks(chatGptAutoScroll);
-                handler.postDelayed(chatGptAutoScroll, SETTLE_MS);
             }
-        } else if (awaitingCompletion) {
-            // Preserve the existing Gemini/Claude completion path.
-            pendingResponse = response;
-            handler.removeCallbacks(finishCheck);
-            handler.postDelayed(finishCheck, SETTLE_MS);
         }
-
         generating = nowGenerating;
+    }
+
+    private void beginChatGptAutoScroll() {
+        stopChatGptAutoScroll();
+        chatGptAutoScrollScheduled = true;
+        handler.postDelayed(chatGptAutoScroll, 250);
     }
 
     private void retryChatGptAutoScroll() {
@@ -196,31 +233,24 @@ public final class AiResponseService extends AccessibilityService {
     }
 
     private boolean scrollForward(AccessibilityNodeInfo root) {
-        if (root.isScrollable()
-                && root.performAction(
-                AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
-            return true;
-        }
-
         ArrayList<AccessibilityNodeInfo> queue = new ArrayList<>();
+        ArrayList<AccessibilityNodeInfo> scrollables = new ArrayList<>();
         queue.add(root);
         for (int i = 0; i < queue.size(); i++) {
-            AccessibilityNodeInfo current = queue.get(i);
-            if (current.isScrollable()
-                    && current.performAction(
-                    AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
-                return true;
-            }
-
-            for (int c = 0; c < current.getChildCount(); c++) {
-                AccessibilityNodeInfo child = current.getChild(c);
-                if (child != null) {
-                    queue.add(child);
-                }
+            AccessibilityNodeInfo node = queue.get(i);
+            if (node.isScrollable()) scrollables.add(node);
+            for (int c = 0; c < node.getChildCount(); c++) {
+                AccessibilityNodeInfo child = node.getChild(c);
+                if (child != null) queue.add(child);
             }
         }
-
-        return root.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
+        Collections.reverse(scrollables);
+        for (AccessibilityNodeInfo node : scrollables) {
+            if (node.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) return true;
+        }
+        // Some ChatGPT versions expose a conversation that is not marked scrollable.
+        // Gesture fallback is intentionally not used here: it can interfere with touch.
+        return false;
     }
 
     private boolean isGenerating(AccessibilityNodeInfo root) {
@@ -307,7 +337,7 @@ public final class AiResponseService extends AccessibilityService {
     private String findLatestChatGptResponse(AccessibilityNodeInfo root) {
         AccessibilityNodeInfo readAloud = findChatGptReadAloudAction(root);
         if (readAloud == null) {
-            return "";
+            return "";  // No reliable assistant-message anchor yet.
         }
 
         AccessibilityNodeInfo branch = readAloud;
@@ -358,7 +388,9 @@ public final class AiResponseService extends AccessibilityService {
                 "読み上げる",
                 "音声で読み上げ",
                 "回答を読み上げ",
-                "音声で回答を読み上げ"
+                "音声で回答を読み上げ",
+                "Copy response", "回答をコピー", "Copy message", "メッセージをコピー",
+                "コピー"
         };
 
         for (String label : labels) {
@@ -703,6 +735,28 @@ public final class AiResponseService extends AccessibilityService {
                 : value.toString().trim().replaceAll("[\\t ]+", " ");
     }
 
+    private void speak(String response) {
+        if (response == null || response.trim().isEmpty()) return;
+        if (!speechReady || speech == null) {
+            Log.w(TAG, "TTS not ready: falling back to announcement");
+            announce(response);
+            return;
+        }
+        String text = response.trim();
+        speech.stop();
+        // Split on length to avoid platform utterance limits.
+        int index = 0;
+        for (int pos = 0; pos < text.length(); pos += MAX_SPEECH_CHUNK) {
+            int end = Math.min(pos + MAX_SPEECH_CHUNK, text.length());
+            String chunk = text.substring(pos, end);
+            speech.speak(chunk,
+                    index == 0 ? TextToSpeech.QUEUE_FLUSH : TextToSpeech.QUEUE_ADD,
+                    null, "waypoint-" + System.currentTimeMillis() + "-" + index);
+            index++;
+        }
+        Log.i(TAG, "Speaking response, chars=" + text.length());
+    }
+
     private void announce(String text) {
         announce(text, "completed-response");
     }
@@ -734,6 +788,11 @@ public final class AiResponseService extends AccessibilityService {
     public void onDestroy() {
         handler.removeCallbacks(finishCheck);
         handler.removeCallbacks(chatGptAutoScroll);
+        if (speech != null) {
+            speech.stop();
+            speech.shutdown();
+            speech = null;
+        }
         super.onDestroy();
     }
 
