@@ -523,3 +523,116 @@ public final class AiResponseService extends AccessibilityService {
             AccessibilityNodeInfo node, String wanted) {
         ArrayList<AccessibilityNodeInfo> queue = new ArrayList<>();
  
+        queue.add(node);
+        for (int i = 0; i < queue.size(); i++) {
+            AccessibilityNodeInfo current = queue.get(i);
+            CharSequence description = current.getContentDescription();
+            if (description != null && description.toString().toLowerCase()
+                    .contains(wanted.toLowerCase())) {
+                return true;
+            }
+            for (int c = 0; c < current.getChildCount(); c++) {
+                AccessibilityNodeInfo child = current.getChild(c);
+                if (child != null) {
+                    queue.add(child);
+                }
+            }
+        }
+        return false;
+    }
+
+    private static AccessibilityNodeInfo findLastByDescription(
+            AccessibilityNodeInfo node, String wanted) {
+        ArrayList<AccessibilityNodeInfo> queue = new ArrayList<>();
+        queue.add(node);
+        AccessibilityNodeInfo found = null;
+        for (int i = 0; i < queue.size(); i++) {
+            AccessibilityNodeInfo current = queue.get(i);
+            CharSequence description = current.getContentDescription();
+            if (description != null && wanted.contentEquals(description)) {
+                found = current;
+            }
+            for (int c = 0; c < current.getChildCount(); c++) {
+                AccessibilityNodeInfo child = current.getChild(c);
+                if (child != null) {
+                    queue.add(child);
+                }
+            }
+        }
+        return found;
+    }
+
+    private static boolean hasText(AccessibilityNodeInfo node, String wanted) {
+        for (AccessibilityNodeInfo textNode : collectTextNodes(node)) {
+            if (wanted.equals(clean(textNode.getText()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasTextContaining(
+            AccessibilityNodeInfo node, String wanted) {
+        for (AccessibilityNodeInfo textNode : collectTextNodes(node)) {
+            if (clean(textNode.getText()).toLowerCase()
+                    .contains(wanted.toLowerCase())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String clean(CharSequence value) {
+        return value == null ? ""
+                : value.toString().trim().replaceAll("[\\t ]+", " ");
+    }
+
+    private void announce(String text) {
+        announce(text, "completed-response");
+    }
+
+    private void announce(String text, String kind) {
+        Log.i(TAG, "Announcing; kind=" + kind
+                + ", package=" + activePackage
+                + ", characters=" + text.length());
+        AccessibilityEvent event = AccessibilityEvent.obtain(
+                AccessibilityEvent.TYPE_ANNOUNCEMENT);
+        event.setPackageName(getPackageName());
+        event.setClassName(getClass().getName());
+        event.getText().add(text);
+        AccessibilityManager manager = (AccessibilityManager)
+                getSystemService(ACCESSIBILITY_SERVICE);
+        if (manager != null && manager.isEnabled()) {
+            manager.sendAccessibilityEvent(event);
+        }
+    }
+
+    @Override
+    public void onInterrupt() {
+        // Accessibility service interrupted.
+    }
+
+    public static boolean isEnabled(Context context) {
+        String enabledServices = android.provider.Settings.Secure.getString(
+                context.getContentResolver(),
+                android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+        if (enabledServices == null) {
+            return false;
+        }
+        TextUtils.SimpleStringSplitter splitter =
+                new TextUtils.SimpleStringSplitter(':');
+        splitter.setString(enabledServices);
+        while (splitter.hasNext()) {
+            android.content.ComponentName component =
+                    android.content.ComponentName.unflattenFromString(
+                            splitter.next());
+            if (component != null
+                    && component.getPackageName().equals(context.getPackageName())
+                    && component.getClassName().equals(AiResponseService.class.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
